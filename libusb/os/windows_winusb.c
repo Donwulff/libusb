@@ -800,6 +800,53 @@ static void winusb_exit(struct libusb_context *ctx)
 	exit_dlls();
 }
 
+// Timeout in milliseconds for synchronous IOCTLs sent to USB hub drivers
+// during device enumeration (e.g. querying descriptors, connection info).
+// On RDS/Terminal Services, an unresponsive hub can hang indefinitely
+// without this timeout.
+#define IOCTL_TIMEOUT_MS	5000
+
+/*
+ * Wrapper for DeviceIoControl that enforces a timeout.
+ * The handle MUST have been opened with FILE_FLAG_OVERLAPPED.
+ */
+static BOOL sync_ioctl(HANDLE handle, DWORD ioctl_code,
+	LPVOID in_buf, DWORD in_size,
+	LPVOID out_buf, DWORD out_size,
+	LPDWORD bytes_returned, DWORD timeout_ms)
+{
+	OVERLAPPED ol;
+	HANDLE event;
+	BOOL ret;
+	DWORD waited;
+
+	event = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (event == NULL)
+		return FALSE;
+
+	memset(&ol, 0, sizeof(ol));
+	ol.hEvent = event;
+
+	ret = DeviceIoControl(handle, ioctl_code, in_buf, in_size,
+		out_buf, out_size, bytes_returned, &ol);
+	if (!ret && GetLastError() == ERROR_IO_PENDING) {
+		waited = WaitForSingleObject(event, timeout_ms);
+		if (waited == WAIT_OBJECT_0) {
+			ret = GetOverlappedResult(handle, &ol, bytes_returned, FALSE);
+		} else {
+			// Timeout or error - cancel the pending I/O
+			CancelIoEx(handle, &ol);
+			// Must wait for cancellation to complete
+			GetOverlappedResult(handle, &ol, bytes_returned, TRUE);
+			SetLastError(ERROR_TIMEOUT);
+			ret = FALSE;
+		}
+	}
+
+	CloseHandle(event);
+	return ret;
+}
+
 /*
  * fetch and cache all the config descriptors through I/O
  */
@@ -845,8 +892,8 @@ static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handl
 		// Dummy call to get the required data size. Initial failures are reported as info rather
 		// than error as they can occur for non-penalizing situations, such as with some hubs.
 		// coverity[tainted_data_argument]
-		if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, &cd_buf_short, size,
-			&cd_buf_short, size, &ret_size, NULL)) {
+		if (!sync_ioctl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, &cd_buf_short, size,
+			&cd_buf_short, size, &ret_size, IOCTL_TIMEOUT_MS)) {
 			usbi_info(ctx, "could not access configuration descriptor %u (dummy) for '%s': %s", i, priv->dev_id, windows_error_str(0));
 			continue;
 		}
@@ -871,8 +918,8 @@ static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handl
 		cd_buf_actual->SetupPacket.wIndex = 0;
 		cd_buf_actual->SetupPacket.wLength = cd_buf_short.desc.wTotalLength;
 
-		if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, cd_buf_actual, size,
-			cd_buf_actual, size, &ret_size, NULL)) {
+		if (!sync_ioctl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, cd_buf_actual, size,
+			cd_buf_actual, size, &ret_size, IOCTL_TIMEOUT_MS)) {
 			usbi_err(ctx, "could not access configuration descriptor %u (actual) for '%s': %s", i, priv->dev_id, windows_error_str(0));
 			continue;
 		}
@@ -1082,13 +1129,13 @@ static int init_root_hub(struct libusb_device *dev)
 	// are forced to query each individual port of the root hub to try and infer the root hub's
 	// speed. Note that we have to query all ports because the presence of a device on that port
 	// changes if/how Windows returns any useful speed information.
-	handle = CreateFileA(priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	handle = CreateFileA(priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 	if (handle == INVALID_HANDLE_VALUE) {
 		usbi_err(ctx, "could not open root hub %s: %s", priv->path, windows_error_str(0));
 		return LIBUSB_ERROR_ACCESS;
 	}
 
-	if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_INFORMATION, NULL, 0, &hub_info, sizeof(hub_info), &size, NULL)) {
+	if (!sync_ioctl(handle, IOCTL_USB_GET_NODE_INFORMATION, NULL, 0, &hub_info, sizeof(hub_info), &size, IOCTL_TIMEOUT_MS)) {
 		usbi_warn(ctx, "could not get root hub info for '%s': %s", priv->dev_id, windows_error_str(0));
 		CloseHandle(handle);
 		return LIBUSB_ERROR_ACCESS;
@@ -1106,8 +1153,8 @@ static int init_root_hub(struct libusb_device *dev)
 			conn_info_v2.ConnectionIndex = port_number;
 			conn_info_v2.Length = sizeof(conn_info_v2);
 			conn_info_v2.SupportedUsbProtocols.Usb300 = 1;
-			if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2,
-				&conn_info_v2, sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, NULL)) {
+			if (!sync_ioctl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2,
+				&conn_info_v2, sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, IOCTL_TIMEOUT_MS)) {
 				usbi_warn(ctx, "could not get node connection information (V2) for root hub '%s' port %lu: %s",
 					priv->dev_id, ULONG_CAST(port_number), windows_error_str(0));
 				break;
@@ -1146,8 +1193,8 @@ static int init_root_hub(struct libusb_device *dev)
 	// highest speed that the root hub supports will not give us the correct speed.
 	for (port_number = 1; port_number <= num_ports; port_number++) {
 		conn_info.ConnectionIndex = port_number;
-		if (!DeviceIoControl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, sizeof(conn_info),
-			&conn_info, sizeof(conn_info), &size, NULL)) {
+		if (!sync_ioctl(handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, sizeof(conn_info),
+			&conn_info, sizeof(conn_info), &size, IOCTL_TIMEOUT_MS)) {
 			usbi_warn(ctx, "could not get node connection information for root hub '%s' port %lu: %s",
 				priv->dev_id, ULONG_CAST(port_number), windows_error_str(0));
 			continue;
@@ -1292,7 +1339,7 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 		dev->parent_dev = parent_dev;
 		priv->depth = depth;
 
-		hub_handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+		hub_handle = CreateFileA(parent_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 		if (hub_handle == INVALID_HANDLE_VALUE) {
 			usbi_warn(ctx, "could not open hub %s: %s", parent_priv->path, windows_error_str(0));
 			return LIBUSB_ERROR_ACCESS;
@@ -1301,8 +1348,8 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 		conn_info.ConnectionIndex = (ULONG)port_number;
 		// coverity[tainted_data_argument]
 
-		if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, sizeof(conn_info),
-			&conn_info, sizeof(conn_info), &size, NULL)) {
+		if (!sync_ioctl(hub_handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, &conn_info, sizeof(conn_info),
+			&conn_info, sizeof(conn_info), &size, IOCTL_TIMEOUT_MS)) {
 			usbi_warn(ctx, "could not get node connection information for device '%s': %s",
 				priv->dev_id, windows_error_str(0));
 			CloseHandle(hub_handle);
@@ -1347,8 +1394,8 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 			conn_info_v2.ConnectionIndex = (ULONG)port_number;
 			conn_info_v2.Length = sizeof(USB_NODE_CONNECTION_INFORMATION_EX_V2);
 			conn_info_v2.SupportedUsbProtocols.Usb300 = 1;
-			if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2,
-				&conn_info_v2, sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, NULL)) {
+			if (!sync_ioctl(hub_handle, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2,
+				&conn_info_v2, sizeof(conn_info_v2), &conn_info_v2, sizeof(conn_info_v2), &size, IOCTL_TIMEOUT_MS)) {
 				usbi_warn(ctx, "could not get node connection information (V2) for device '%s': %s",
 					priv->dev_id,  windows_error_str(0));
 			} else if (conn_info_v2.Flags.DeviceIsOperatingAtSuperSpeedPlusOrHigher) {
@@ -2432,7 +2479,7 @@ static int winusb_get_device_string(libusb_device *dev,
 	}
 
 	struct winusb_device_priv* hub_priv = usbi_get_device_priv(dev->parent_dev);
-	HANDLE hub_handle = CreateFileA(hub_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	HANDLE hub_handle = CreateFileA(hub_priv->path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 	if (hub_handle == INVALID_HANDLE_VALUE) {
 		usbi_warn(ctx, "could not open hub %s: %s", hub_priv->path, windows_error_str(0));
 		return LIBUSB_ERROR_ACCESS;
@@ -2447,8 +2494,8 @@ static int winusb_get_device_string(libusb_device *dev,
 	sd.req.SetupPacket.wIndex = 0;
 	sd.req.SetupPacket.wLength = (USHORT)sizeof(sd.desc);
 
-	BOOL rv = DeviceIoControl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, &sd, size,
-		&sd, size, &ret_size, NULL);
+	BOOL rv = sync_ioctl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, &sd, size,
+		&sd, size, &ret_size, IOCTL_TIMEOUT_MS);
 	CloseHandle(hub_handle);
 	if (!rv) {
 		usbi_err(ctx, "could not access string descriptor %u for '%s': %s", string_descriptor_idx,
