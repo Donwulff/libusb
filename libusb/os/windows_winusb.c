@@ -3147,6 +3147,14 @@ static int winusbx_open(int sub_api, struct libusb_device_handle *dev_handle)
 			file_handle = windows_open(dev_handle, priv->usb_interface[i].path, GENERIC_READ | GENERIC_WRITE);
 			if (file_handle == INVALID_HANDLE_VALUE) {
 				usbi_err(HANDLE_CTX(dev_handle), "could not open device %s (interface %d): %s", priv->usb_interface[i].path, i, windows_error_str(0));
+				// Close any handles that were successfully opened
+				// in previous iterations to avoid leaking them
+				for (int j = i - 1; j >= 0; j--) {
+					if (HANDLE_VALID(handle_priv->interface_handle[j].dev_handle)) {
+						CloseHandle(handle_priv->interface_handle[j].dev_handle);
+						handle_priv->interface_handle[j].dev_handle = INVALID_HANDLE_VALUE;
+					}
+				}
 				switch (GetLastError()) {
 				case ERROR_FILE_NOT_FOUND: // The device was disconnected
 					return LIBUSB_ERROR_NO_DEVICE;
