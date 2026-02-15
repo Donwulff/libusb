@@ -898,6 +898,95 @@ static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handl
 	}
 }
 
+/*
+ * Fetch and cache config descriptors via WinUSB ControlTransfer.
+ * Used as a fallback when the device was not initialized through
+ * a parent hub (e.g. RDS/Terminal Services USB redirection) and
+ * thus cache_config_descriptors() could not be used.
+ */
+static void cache_config_descriptors_via_winusb(struct libusb_device *dev,
+	HANDLE winusb_handle, int sub_api)
+{
+	struct libusb_context *ctx = DEVICE_CTX(dev);
+	struct winusb_device_priv *priv = usbi_get_device_priv(dev);
+	WINUSB_SETUP_PACKET setup;
+	USB_CONFIGURATION_DESCRIPTOR cd_short;
+	PUSB_CONFIGURATION_DESCRIPTOR cd_data;
+	ULONG transferred;
+	uint8_t i, num_configurations;
+
+	if (priv->config_descriptor != NULL)
+		return;
+
+	num_configurations = dev->device_descriptor.bNumConfigurations;
+	if (num_configurations == 0)
+		return;
+
+	priv->config_descriptor = calloc(num_configurations, sizeof(PUSB_CONFIGURATION_DESCRIPTOR));
+	if (priv->config_descriptor == NULL) {
+		usbi_err(ctx, "could not allocate configuration descriptor array for '%s'", priv->dev_id);
+		return;
+	}
+
+	for (i = 0; i < num_configurations; i++) {
+		// First, get the short descriptor to learn wTotalLength
+		memset(&setup, 0, sizeof(setup));
+		setup.RequestType = LIBUSB_ENDPOINT_IN;
+		setup.Request = LIBUSB_REQUEST_GET_DESCRIPTOR;
+		setup.Value = (LIBUSB_DT_CONFIG << 8) | i;
+		setup.Index = 0;
+		setup.Length = sizeof(USB_CONFIGURATION_DESCRIPTOR);
+
+		if (!WinUSBX[sub_api].ControlTransfer(winusb_handle, setup,
+				(PUCHAR)&cd_short, sizeof(cd_short), &transferred, NULL)) {
+			usbi_warn(ctx, "could not read config descriptor %u (short) for '%s': %s",
+				i, priv->dev_id, windows_error_str(0));
+			continue;
+		}
+
+		if (transferred < sizeof(USB_CONFIGURATION_DESCRIPTOR)
+				|| cd_short.wTotalLength < sizeof(USB_CONFIGURATION_DESCRIPTOR)) {
+			usbi_warn(ctx, "unexpected config descriptor %u size (short) for '%s'",
+				i, priv->dev_id);
+			continue;
+		}
+
+		// Now fetch the full descriptor.
+		// Allocate with USB_DESCRIPTOR_REQUEST_SIZE prefix to match the
+		// layout expected by winusb_device_priv_release(), which frees
+		// at (config_descriptor[i] - USB_DESCRIPTOR_REQUEST_SIZE).
+		{
+			UCHAR *buf = malloc(USB_DESCRIPTOR_REQUEST_SIZE + cd_short.wTotalLength);
+			if (buf == NULL) {
+				usbi_err(ctx, "could not allocate config descriptor %u buffer for '%s'",
+					i, priv->dev_id);
+				continue;
+			}
+			cd_data = (PUSB_CONFIGURATION_DESCRIPTOR)(buf + USB_DESCRIPTOR_REQUEST_SIZE);
+		}
+
+		setup.Length = cd_short.wTotalLength;
+
+		if (!WinUSBX[sub_api].ControlTransfer(winusb_handle, setup,
+				(PUCHAR)cd_data, cd_short.wTotalLength, &transferred, NULL)) {
+			usbi_warn(ctx, "could not read config descriptor %u (full) for '%s': %s",
+				i, priv->dev_id, windows_error_str(0));
+			free((UCHAR *)cd_data - USB_DESCRIPTOR_REQUEST_SIZE);
+			continue;
+		}
+
+		if (transferred < cd_short.wTotalLength || cd_data->bDescriptorType != LIBUSB_DT_CONFIG) {
+			usbi_warn(ctx, "unexpected config descriptor %u data for '%s'", i, priv->dev_id);
+			free((UCHAR *)cd_data - USB_DESCRIPTOR_REQUEST_SIZE);
+			continue;
+		}
+
+		usbi_dbg(ctx, "cached config descriptor %u via WinUSB (bConfigurationValue=%u, %u bytes)",
+			i, cd_data->bConfigurationValue, cd_data->wTotalLength);
+		priv->config_descriptor[i] = cd_data;
+	}
+}
+
 #define ROOT_HUB_FS_CONFIG_DESC_LENGTH		0x19
 #define ROOT_HUB_HS_CONFIG_DESC_LENGTH		0x19
 #define ROOT_HUB_SS_CONFIG_DESC_LENGTH		0x1f
@@ -3280,6 +3369,14 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 		}
 		handle_priv->interface_handle[iface].dev_handle = handle_priv->interface_handle[initialized_iface].dev_handle;
 	}
+	// If config descriptors were not cached (e.g. RDS/Terminal Services
+	// device with no parent hub), fetch them now via the WinUSB handle
+	if (priv->config_descriptor == NULL) {
+		winusb_handle = handle_priv->interface_handle[iface].api_handle;
+		if (HANDLE_VALID(winusb_handle))
+			cache_config_descriptors_via_winusb(dev_handle->dev, winusb_handle, sub_api);
+	}
+
 	usbi_dbg(ctx, "claimed interface %u", iface);
 	handle_priv->active_interface = iface;
 
