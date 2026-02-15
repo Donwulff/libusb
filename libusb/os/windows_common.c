@@ -604,8 +604,16 @@ static void windows_exit(struct libusb_context *ctx)
 	if (!PostQueuedCompletionStatus(priv->completion_port, 0, (ULONG_PTR)ctx, NULL))
 		usbi_err(ctx, "failed to post I/O completion: %s", windows_error_str(0));
 
-	if (WaitForSingleObject(priv->completion_port_thread, INFINITE) == WAIT_FAILED)
+	switch (WaitForSingleObject(priv->completion_port_thread, 5000)) {
+	case WAIT_OBJECT_0:
+		break;
+	case WAIT_TIMEOUT:
+		usbi_warn(ctx, "I/O completion port thread did not exit within 5 seconds, proceeding with cleanup");
+		break;
+	default:
 		usbi_err(ctx, "failed to wait for I/O completion port thread: %s", windows_error_str(0));
+		break;
+	}
 
 	CloseHandle(priv->completion_port_thread);
 	CloseHandle(priv->completion_port);
