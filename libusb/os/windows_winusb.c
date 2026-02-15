@@ -481,6 +481,65 @@ static struct libusb_device *get_ancestor(struct libusb_context *ctx,
 }
 
 /*
+ * Initialize a USB device without a parent hub, using information from
+ * the PnP device instance ID to populate a minimal device descriptor.
+ *
+ * This is used for devices under non-standard USB bus enumerators such
+ * as Windows RDS/Terminal Services (TS_USB_HUB_Enumerator), where the
+ * virtual hub does not implement the standard USB hub interface and
+ * cannot be queried for device descriptors via IOCTLs.
+ *
+ * The device will have a synthetic descriptor with VID/PID parsed from
+ * the device instance ID. Config descriptors are not available through
+ * this path but composite interface paths (set up during HID/EXT passes)
+ * will still work for device I/O.
+ */
+static int init_device_from_devid(struct libusb_device *dev,
+	uint8_t bus_number, const char *dev_id)
+{
+	struct libusb_context *ctx = DEVICE_CTX(dev);
+	struct winusb_device_priv *priv = usbi_get_device_priv(dev);
+	unsigned int vid, pid;
+	const char *vid_str, *pid_str;
+	int r;
+
+	if (priv->initialized)
+		return LIBUSB_SUCCESS;
+
+	vid_str = strstr(dev_id, "VID_");
+	pid_str = strstr(dev_id, "PID_");
+	if (vid_str == NULL || pid_str == NULL
+		|| sscanf(vid_str, "VID_%4x", &vid) != 1
+		|| sscanf(pid_str, "PID_%4x", &pid) != 1) {
+		usbi_warn(ctx, "could not parse VID/PID from '%s'", dev_id);
+		return LIBUSB_ERROR_NOT_FOUND;
+	}
+
+	// Populate a minimal device descriptor
+	dev->device_descriptor.bLength = LIBUSB_DT_DEVICE_SIZE;
+	dev->device_descriptor.bDescriptorType = LIBUSB_DT_DEVICE;
+	dev->device_descriptor.idVendor = (uint16_t)vid;
+	dev->device_descriptor.idProduct = (uint16_t)pid;
+	dev->device_descriptor.bNumConfigurations = 1;
+	dev->device_descriptor.bDeviceClass = LIBUSB_CLASS_PER_INTERFACE;
+
+	priv->active_config = 1;
+	dev->bus_number = bus_number;
+	dev->device_address = 1;
+
+	r = usbi_sanitize_device(dev);
+	if (r)
+		return r;
+
+	priv->initialized = true;
+
+	usbi_dbg(ctx, "initialized from devid (bus: %u, vid: %04x, pid: %04x): '%s'",
+		bus_number, vid, pid, dev_id);
+
+	return LIBUSB_SUCCESS;
+}
+
+/*
  * Determine which interface the given endpoint address belongs to
  */
 static int get_interface_by_endpoint(struct libusb_config_descriptor *conf_desc, uint8_t ep)
@@ -1870,17 +1929,29 @@ static int winusb_get_device_list(struct libusb_context *ctx, struct discovered_
 						libusb_unref_device(dev);
 					}
 
-					usbi_dbg(ctx, "unlisted ancestor for '%s' (non USB HID, newly connected, etc.) - ignoring", dev_id);
-					continue;
+					// For USB devices with no known ancestor, allow them
+					// through for initialization via init_device_from_devid().
+					// This handles non-standard USB bus enumerators such as
+					// Windows RDS/Terminal Services TS_USB_HUB_Enumerator,
+					// where the virtual hub is not discoverable as a USB hub.
+					if ((pass == GEN_PASS) && (strncmp(dev_id, "USB\\VID_", 8) == 0)) {
+						usbi_dbg(ctx, "USB device '%s' has no known hub ancestor, "
+							"will attempt initialization from device instance ID", dev_id);
+					} else {
+						usbi_dbg(ctx, "unlisted ancestor for '%s' (non USB HID, newly connected, etc.) - ignoring", dev_id);
+						continue;
+					}
 				}
 
-				parent_priv = usbi_get_device_priv(parent_dev);
-				// virtual USB devices are also listed during GEN - don't process these yet
-				if ((pass == GEN_PASS) && (parent_priv->apib->id != USB_API_HUB)) {
-					usbi_dbg(ctx, "skipping '%s' in GEN pass - parent '%s' api=%u is not HUB",
-						dev_id, parent_priv->dev_id, (unsigned)parent_priv->apib->id);
-					libusb_unref_device(parent_dev);
-					continue;
+				if (parent_dev != NULL) {
+					parent_priv = usbi_get_device_priv(parent_dev);
+					// virtual USB devices are also listed during GEN - don't process these yet
+					if ((pass == GEN_PASS) && (parent_priv->apib->id != USB_API_HUB)) {
+						usbi_dbg(ctx, "skipping '%s' in GEN pass - parent '%s' api=%u is not HUB",
+							dev_id, parent_priv->dev_id, (unsigned)parent_priv->apib->id);
+						libusb_unref_device(parent_dev);
+						continue;
+					}
 				}
 			}
 
@@ -2003,14 +2074,20 @@ static int winusb_get_device_list(struct libusb_context *ctx, struct discovered_
 				port_nr = 0;
 #if defined(LIBUSB_WINDOWS_HOTPLUG)
 				if (priv->initialized) {
-					libusb_unref_device(parent_dev);
+					if (parent_dev != NULL)
+						libusb_unref_device(parent_dev);
 					r = LIBUSB_SUCCESS;
 				}
 				else {
 #endif
-					if (!get_dev_port_number(*dev_info, &dev_info_data, &port_nr))
-						usbi_warn(ctx, "could not retrieve port number for device '%s': %s", dev_id, windows_error_str(0));
-					r = init_device(dev, parent_dev, (uint8_t)port_nr, dev_info_data.DevInst);
+					if (parent_dev != NULL) {
+						if (!get_dev_port_number(*dev_info, &dev_info_data, &port_nr))
+							usbi_warn(ctx, "could not retrieve port number for device '%s': %s", dev_id, windows_error_str(0));
+						r = init_device(dev, parent_dev, (uint8_t)port_nr, dev_info_data.DevInst);
+					} else {
+						// Device under non-standard bus enumerator (e.g. RDS)
+						r = init_device_from_devid(dev, ++bus_number, dev_id);
+					}
 #if defined(LIBUSB_WINDOWS_HOTPLUG)
 				}
 #endif
