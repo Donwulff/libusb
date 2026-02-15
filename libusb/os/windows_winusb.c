@@ -3239,7 +3239,7 @@ static int winusbx_configure_endpoints(int sub_api, struct libusb_device_handle 
 	struct winusb_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
 	HANDLE winusb_handle = handle_priv->interface_handle[iface].api_handle;
 	UCHAR policy;
-	ULONG timeout = 0;
+	ULONG timeout = 5000;
 	uint8_t endpoint_address;
 	int i;
 
