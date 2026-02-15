@@ -186,6 +186,7 @@ static bool init_dlls(struct libusb_context *ctx)
 	DLL_GET_HANDLE(ctx, Cfgmgr32);
 	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Parent, true);
 	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Child, true);
+	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Device_IDA, true);
 
 	// Prefixed to avoid conflict with header files
 	DLL_GET_HANDLE(ctx, AdvAPI32);
@@ -456,12 +457,21 @@ static struct libusb_device *get_ancestor(struct libusb_context *ctx,
 {
 	struct libusb_device *dev = NULL;
 	DEVINST parent_devinst;
+	char ancestor_id[MAX_PATH_LENGTH];
 
 	while (dev == NULL) {
 		if (CM_Get_Parent(&parent_devinst, devinst, 0) != CR_SUCCESS)
 			break;
 		devinst = parent_devinst;
 		dev = usbi_get_device_by_session_id(ctx, (unsigned long)devinst);
+		if (dev == NULL) {
+			if (CM_Get_Device_IDA(devinst, ancestor_id, sizeof(ancestor_id), 0) == CR_SUCCESS)
+				usbi_dbg(ctx, "get_ancestor: skipping unknown ancestor devInst %lX = '%s'",
+					ULONG_CAST(devinst), ancestor_id);
+			else
+				usbi_dbg(ctx, "get_ancestor: skipping unknown ancestor devInst %lX",
+					ULONG_CAST(devinst));
+		}
 	}
 
 	if ((dev != NULL) && (_parent_devinst != NULL))
@@ -1092,7 +1102,8 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 		ctx = DEVICE_CTX(dev);
 		parent_priv = usbi_get_device_priv(parent_dev);
 		if (parent_priv->apib->id != USB_API_HUB) {
-			usbi_warn(ctx, "parent for device '%s' is not a hub", priv->dev_id);
+			usbi_warn(ctx, "parent for device '%s' is not a hub (parent '%s' api=%u)",
+				priv->dev_id, parent_priv->dev_id, (unsigned)parent_priv->apib->id);
 			return LIBUSB_ERROR_NOT_FOUND;
 		}
 
@@ -1866,6 +1877,8 @@ static int winusb_get_device_list(struct libusb_context *ctx, struct discovered_
 				parent_priv = usbi_get_device_priv(parent_dev);
 				// virtual USB devices are also listed during GEN - don't process these yet
 				if ((pass == GEN_PASS) && (parent_priv->apib->id != USB_API_HUB)) {
+					usbi_dbg(ctx, "skipping '%s' in GEN pass - parent '%s' api=%u is not HUB",
+						dev_id, parent_priv->dev_id, (unsigned)parent_priv->apib->id);
 					libusb_unref_device(parent_dev);
 					continue;
 				}
