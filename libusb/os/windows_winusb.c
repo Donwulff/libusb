@@ -499,8 +499,8 @@ static int init_device_from_devid(struct libusb_device *dev,
 {
 	struct libusb_context *ctx = DEVICE_CTX(dev);
 	struct winusb_device_priv *priv = usbi_get_device_priv(dev);
-	unsigned int vid, pid;
-	const char *vid_str, *pid_str;
+	unsigned int vid, pid, rev;
+	const char *vid_str, *pid_str, *rev_str;
 	int r;
 
 	if (priv->initialized)
@@ -515,11 +515,20 @@ static int init_device_from_devid(struct libusb_device *dev,
 		return LIBUSB_ERROR_NOT_FOUND;
 	}
 
-	// Populate a minimal device descriptor
+	rev_str = strstr(dev_id, "REV_");
+	if (rev_str == NULL || sscanf(rev_str, "REV_%4x", &rev) != 1)
+		rev = 0;
+
+	// Populate a device descriptor from the device instance ID.
+	// This is a best-effort synthetic descriptor; the real one will
+	// be fetched via WinUSB ControlTransfer once an interface is claimed.
 	dev->device_descriptor.bLength = LIBUSB_DT_DEVICE_SIZE;
 	dev->device_descriptor.bDescriptorType = LIBUSB_DT_DEVICE;
+	dev->device_descriptor.bcdUSB = 0x0200;
 	dev->device_descriptor.idVendor = (uint16_t)vid;
 	dev->device_descriptor.idProduct = (uint16_t)pid;
+	dev->device_descriptor.bcdDevice = (uint16_t)rev;
+	dev->device_descriptor.bMaxPacketSize0 = 64;
 	dev->device_descriptor.bNumConfigurations = 1;
 	dev->device_descriptor.bDeviceClass = LIBUSB_CLASS_PER_INTERFACE;
 
@@ -943,6 +952,53 @@ static void cache_config_descriptors(struct libusb_device *dev, HANDLE hub_handl
 		priv->config_descriptor[i] = cd_data;
 		cd_buf_actual = NULL;
 	}
+}
+
+/*
+ * Fetch the real device descriptor via WinUSB ControlTransfer.
+ * Used to replace the synthetic descriptor created by init_device_from_devid()
+ * with the actual descriptor from the device, which includes string descriptor
+ * indices (iManufacturer, iProduct, iSerialNumber), bcdUSB, bcdDevice, etc.
+ */
+static void fetch_device_descriptor_via_winusb(struct libusb_device *dev,
+	HANDLE winusb_handle, int sub_api)
+{
+	struct libusb_context *ctx = DEVICE_CTX(dev);
+	struct winusb_device_priv *priv = usbi_get_device_priv(dev);
+	WINUSB_SETUP_PACKET setup;
+	struct libusb_device_descriptor dev_desc;
+	ULONG transferred;
+
+	memset(&setup, 0, sizeof(setup));
+	setup.RequestType = LIBUSB_ENDPOINT_IN;
+	setup.Request = LIBUSB_REQUEST_GET_DESCRIPTOR;
+	setup.Value = (LIBUSB_DT_DEVICE << 8);
+	setup.Index = 0;
+	setup.Length = LIBUSB_DT_DEVICE_SIZE;
+
+	if (!WinUSBX[sub_api].ControlTransfer(winusb_handle, setup,
+			(PUCHAR)&dev_desc, LIBUSB_DT_DEVICE_SIZE, &transferred, NULL)) {
+		usbi_warn(ctx, "could not read device descriptor for '%s': %s",
+			priv->dev_id, windows_error_str(0));
+		return;
+	}
+
+	if (transferred < LIBUSB_DT_DEVICE_SIZE
+			|| dev_desc.bLength != LIBUSB_DT_DEVICE_SIZE
+			|| dev_desc.bDescriptorType != LIBUSB_DT_DEVICE) {
+		usbi_warn(ctx, "unexpected device descriptor for '%s' (transferred=%lu, bLength=%u, bDescriptorType=%u)",
+			priv->dev_id, transferred, dev_desc.bLength, dev_desc.bDescriptorType);
+		return;
+	}
+
+	memcpy(&dev->device_descriptor, &dev_desc, LIBUSB_DT_DEVICE_SIZE);
+	usbi_localize_device_descriptor(&dev->device_descriptor);
+
+	usbi_dbg(ctx, "fetched real device descriptor via WinUSB for '%s' "
+		"(bcdUSB=%04x, bcdDevice=%04x, iManufacturer=%u, iProduct=%u, iSerialNumber=%u)",
+		priv->dev_id, dev->device_descriptor.bcdUSB, dev->device_descriptor.bcdDevice,
+		dev->device_descriptor.iManufacturer, dev->device_descriptor.iProduct,
+		dev->device_descriptor.iSerialNumber);
 }
 
 /*
@@ -2280,6 +2336,56 @@ static int winusb_get_device_list(struct libusb_context *ctx, struct discovered_
 
 	pSetupDiDestroyDeviceInfoList(dev_info_intf);
 
+	// For devices initialized via init_device_from_devid() (no parent hub),
+	// the device descriptor is synthetic and config descriptors are missing.
+	// Now that all passes are complete and interface paths are known, try to
+	// fetch the real descriptors via WinUSB before returning the device list.
+	if (r == LIBUSB_SUCCESS && _discdevs != NULL) {
+		for (i = 0; i < (*_discdevs)->len; i++) {
+			dev = (*_discdevs)->devices[i];
+			priv = usbi_get_device_priv(dev);
+			if (priv->config_descriptor != NULL)
+				continue; // already has real descriptors
+
+			// Find first WinUSB interface path to use for descriptor fetching
+			for (j = 0; j < USB_MAXINTERFACES; j++) {
+				HANDLE desc_handle, desc_winusb;
+				int sa;
+
+				if (priv->usb_interface[j].path == NULL
+						|| priv->usb_interface[j].apib->id != USB_API_WINUSBX)
+					continue;
+
+				sa = priv->usb_interface[j].sub_api;
+				if (WinUSBX[sa].hDll == NULL)
+					continue;
+
+				desc_handle = CreateFileA(priv->usb_interface[j].path,
+					GENERIC_READ | GENERIC_WRITE,
+					FILE_SHARE_READ | FILE_SHARE_WRITE,
+					NULL, OPEN_EXISTING,
+					FILE_FLAG_OVERLAPPED, NULL);
+				if (desc_handle == INVALID_HANDLE_VALUE) {
+					usbi_dbg(ctx, "could not open '%s' for descriptor fetch: %s",
+						priv->usb_interface[j].path, windows_error_str(0));
+					continue;
+				}
+
+				if (WinUSBX[sa].Initialize(desc_handle, &desc_winusb)) {
+					fetch_device_descriptor_via_winusb(dev, desc_winusb, sa);
+					cache_config_descriptors_via_winusb(dev, desc_winusb, sa);
+					WinUSBX[sa].Free(desc_winusb);
+				} else {
+					usbi_dbg(ctx, "WinUSB init failed for '%s': %s",
+						priv->usb_interface[j].path, windows_error_str(0));
+				}
+
+				CloseHandle(desc_handle);
+				break; // done with this device
+			}
+		}
+	}
+
 	// Free any additional GUIDs
 	for (pass = EXT_PASS; pass < nb_guids; pass++)
 		free((void *)guid_list[pass]);
@@ -3147,12 +3253,15 @@ static int winusbx_open(int sub_api, struct libusb_device_handle *dev_handle)
 			file_handle = windows_open(dev_handle, priv->usb_interface[i].path, GENERIC_READ | GENERIC_WRITE);
 			if (file_handle == INVALID_HANDLE_VALUE) {
 				usbi_err(HANDLE_CTX(dev_handle), "could not open device %s (interface %d): %s", priv->usb_interface[i].path, i, windows_error_str(0));
-				// Close any handles that were successfully opened
-				// in previous iterations to avoid leaking them
-				for (int j = i - 1; j >= 0; j--) {
-					if (HANDLE_VALID(handle_priv->interface_handle[j].dev_handle)) {
-						CloseHandle(handle_priv->interface_handle[j].dev_handle);
-						handle_priv->interface_handle[j].dev_handle = INVALID_HANDLE_VALUE;
+				{
+					// Close any handles that were successfully opened
+					// in previous iterations to avoid leaking them
+					int j;
+					for (j = i - 1; j >= 0; j--) {
+						if (HANDLE_VALID(handle_priv->interface_handle[j].dev_handle)) {
+							CloseHandle(handle_priv->interface_handle[j].dev_handle);
+							handle_priv->interface_handle[j].dev_handle = INVALID_HANDLE_VALUE;
+						}
 					}
 				}
 				switch (GetLastError()) {
@@ -3424,12 +3533,15 @@ static int winusbx_claim_interface(int sub_api, struct libusb_device_handle *dev
 		}
 		handle_priv->interface_handle[iface].dev_handle = handle_priv->interface_handle[initialized_iface].dev_handle;
 	}
-	// If config descriptors were not cached (e.g. RDS/Terminal Services
-	// device with no parent hub), fetch them now via the WinUSB handle
+	// For devices initialized via init_device_from_devid() (e.g. RDS/Terminal
+	// Services USB redirection), the device descriptor is synthetic and config
+	// descriptors are not cached. Fetch the real ones now via WinUSB.
 	if (priv->config_descriptor == NULL) {
 		winusb_handle = handle_priv->interface_handle[iface].api_handle;
-		if (HANDLE_VALID(winusb_handle))
+		if (HANDLE_VALID(winusb_handle)) {
+			fetch_device_descriptor_via_winusb(dev_handle->dev, winusb_handle, sub_api);
 			cache_config_descriptors_via_winusb(dev_handle->dev, winusb_handle, sub_api);
+		}
 	}
 
 	usbi_dbg(ctx, "claimed interface %u", iface);
