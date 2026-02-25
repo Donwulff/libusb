@@ -1,6 +1,6 @@
 For detailed information about the changes below, please see the git log.
 
-202?-??-??: v1.0.30
+2026-02-22: v1.0.30-rc1
 * Add hotplug support on Microsoft Windows
 * Add RAW_IO support in WinUSB backend
 * Work around a macOS 26 Tahoe compatibility breakage due to Apple changing kUSBHostPortPropertyPortNumber
