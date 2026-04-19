@@ -1420,7 +1420,7 @@ static int init_device(struct libusb_device *dev, struct libusb_device *parent_d
 
 		if ((conn_info.DeviceDescriptor.bLength != LIBUSB_DT_DEVICE_SIZE)
 			|| (conn_info.DeviceDescriptor.bDescriptorType != LIBUSB_DT_DEVICE)) {
-			usbi_err(ctx, "device '%s' has invalid descriptor!", priv->dev_id);
+			usbi_warn(ctx, "device '%s' has invalid descriptor!", priv->dev_id);
 			CloseHandle(hub_handle);
 			return LIBUSB_ERROR_OTHER;
 		}
@@ -2162,6 +2162,9 @@ static int winusb_get_device_list(struct libusb_context *ctx, struct discovered_
 					usbi_attach_device(dev);
 #endif
 					priv = winusb_device_priv_init(dev);
+#if defined(LIBUSB_WINDOWS_HOTPLUG)
+					priv->seen_during_scan = true;
+#endif
 					priv->dev_id = _strdup(dev_id);
 					priv->class_guid = dev_info_data.ClassGuid;
 					if (priv->dev_id == NULL) {
@@ -2193,6 +2196,9 @@ static int winusb_get_device_list(struct libusb_context *ctx, struct discovered_
 						libusb_unref_device(dev);
 						goto alloc_device;
 					}
+#if defined(LIBUSB_WINDOWS_HOTPLUG)
+					priv->seen_during_scan = true;
+#endif
 				}
 
 			track_unref:
@@ -2264,14 +2270,10 @@ static int winusb_get_device_list(struct libusb_context *ctx, struct discovered_
 				break;
 			case GEN_PASS:
 				port_nr = 0;
-#if defined(LIBUSB_WINDOWS_HOTPLUG)
 				if (priv->initialized) {
-					if (parent_dev != NULL)
-						libusb_unref_device(parent_dev);
+					libusb_unref_device(parent_dev);
 					r = LIBUSB_SUCCESS;
-				}
-				else {
-#endif
+				} else {
 					if (parent_dev != NULL) {
 						if (!get_dev_port_number(*dev_info, &dev_info_data, &port_nr))
 							usbi_warn(ctx, "could not retrieve port number for device '%s': %s", dev_id, windows_error_str(0));
@@ -2280,9 +2282,7 @@ static int winusb_get_device_list(struct libusb_context *ctx, struct discovered_
 						// Device under non-standard bus enumerator (e.g. RDS)
 						r = init_device_from_devid(dev, ++bus_number, dev_id);
 					}
-#if defined(LIBUSB_WINDOWS_HOTPLUG)
 				}
-#endif
 				if (r == LIBUSB_SUCCESS) {
 					// Append device to the list of discovered devices
 					if (_discdevs) {
@@ -2538,22 +2538,22 @@ static int usbi_utf16le_to_utf8(uint8_t const *src, int src_length, char *dst, i
 
 /*
  * Backend implementation for libusb_get_device_string().
- * 
+ *
  * Windows makes getting the common device strings
  * very difficult.  DEVPKEY_Device_* does not have SerialNumber,
  * and it reports the driver manufacturer, not the device manufacturer.
- * 
+ *
  * We could parse the serial number from the DEVICE_ID string:
  * https://learn.microsoft.com/en-us/windows-hardware/drivers/install/device-instance-ids
  * https://learn.microsoft.com/en-us/windows-hardware/drivers/install/standard-usb-identifiers
- * 
- * However, using the dev_id for getting the serial number is 
+ *
+ * However, using the dev_id for getting the serial number is
  * definitely not recommended.
  *
  * The following implementation uses an IOCTL
  * to the parent USB hub to perform the USB control request for the
  * string descriptor without opening the USB device.
- * While we would rather not invoke USB IO, we currently lack a 
+ * While we would rather not invoke USB IO, we currently lack a
  * better option.
  */
 static int winusb_get_device_string(libusb_device *dev,
@@ -2581,7 +2581,7 @@ static int winusb_get_device_string(libusb_device *dev,
 	}
 
 	if (0 == string_descriptor_idx) {
-		return 0;
+		return LIBUSB_ERROR_NOT_FOUND;
 	}
 
 	struct winusb_device_priv* hub_priv = usbi_get_device_priv(dev->parent_dev);
@@ -2591,13 +2591,45 @@ static int winusb_get_device_string(libusb_device *dev,
 		return LIBUSB_ERROR_ACCESS;
 	}
 
+	// Fetch and cache the device's primary USB language ID.
+	// String descriptor 0 with wIndex=0 returns the supported language table
+	// (USB 2.0 spec section 9.6.7). We use the first (primary) LANGID for
+	// all subsequent string descriptor requests.
+	if (0 == priv->langid) {
+		size = sizeof(sd);
+		memset(&sd, 0, size);
+		sd.req.ConnectionIndex = (ULONG)dev->port_number;
+		sd.req.SetupPacket.bmRequest = LIBUSB_ENDPOINT_IN;
+		sd.req.SetupPacket.bRequest = LIBUSB_REQUEST_GET_DESCRIPTOR;
+		sd.req.SetupPacket.wValue = (LIBUSB_DT_STRING << 8) | 0;
+		sd.req.SetupPacket.wIndex = 0;
+		sd.req.SetupPacket.wLength = (USHORT)sizeof(sd.desc);
+
+		if (!DeviceIoControl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, &sd, size,
+			&sd, size, &ret_size, NULL)) {
+			usbi_warn(ctx, "could not retrieve language IDs for '%s': %s",
+				priv->dev_id, windows_error_str(0));
+			CloseHandle(hub_handle);
+			return LIBUSB_ERROR_IO;
+		}
+
+		if (sd.desc.bDescriptorType != LIBUSB_DT_STRING || sd.desc.bLength < 4) {
+			usbi_warn(ctx, "invalid language ID descriptor for '%s'", priv->dev_id);
+			CloseHandle(hub_handle);
+			return LIBUSB_ERROR_IO;
+		}
+
+		priv->langid = (uint16_t)sd.desc.bString[0] | ((uint16_t)sd.desc.bString[1] << 8);
+		usbi_dbg(ctx, "cached language ID 0x%04x for '%s'", priv->langid, priv->dev_id);
+	}
+
 	size = sizeof(sd);
 	memset(&sd, 0, size);
 	sd.req.ConnectionIndex = (ULONG)dev->port_number;
 	sd.req.SetupPacket.bmRequest = LIBUSB_ENDPOINT_IN;
 	sd.req.SetupPacket.bRequest = LIBUSB_REQUEST_GET_DESCRIPTOR;
 	sd.req.SetupPacket.wValue = (LIBUSB_DT_STRING << 8) | string_descriptor_idx;
-	sd.req.SetupPacket.wIndex = 0;
+	sd.req.SetupPacket.wIndex = priv->langid;
 	sd.req.SetupPacket.wLength = (USHORT)sizeof(sd.desc);
 
 	BOOL rv = sync_ioctl(hub_handle, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, &sd, size,
@@ -2606,12 +2638,12 @@ static int winusb_get_device_string(libusb_device *dev,
 	if (!rv) {
 		usbi_err(ctx, "could not access string descriptor %u for '%s': %s", string_descriptor_idx,
 			priv->dev_id, windows_error_str(0));
-		return 0;
+		return LIBUSB_ERROR_IO;
 	}
 
 	if (sd.desc.bDescriptorType != LIBUSB_DT_STRING) {
 		usbi_err(ctx, "descriptor %u not a string descriptor for '%s'", string_descriptor_idx, priv->dev_id);
-		return 0;
+		return LIBUSB_ERROR_IO;
 	}
 
 	return usbi_utf16le_to_utf8(sd.desc.bString, (int) (sd.desc.bLength - 2), data, length);
